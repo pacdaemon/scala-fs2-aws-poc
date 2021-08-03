@@ -47,7 +47,7 @@ object Fs2Poc extends IOApp {
 
   val create = sql"""
     CREATE TABLE sample_data(
-    index_id CHAR(3),
+    index_id CHAR(12),
     at DATE,
     open NUMERIC(12,6),
     high NUMERIC(12,6),
@@ -142,17 +142,24 @@ object Fs2Poc extends IOApp {
     transactor.use { xa =>
       for {
         _ <- (drop, create).mapN(_ + _).transact(xa)
-        elems <- Files[IO]
+        recordCount <- Files[IO]
+          .readAll(Paths.get("testdata/IndexProcessed.csv"), 4096)
+          .through(text.utf8Decode)
+          .through(text.lines)
+          .compile
+          .count
+        start <- Clock[IO].monotonic
+        _ <- Files[IO]
           .readAll(Paths.get("testdata/IndexProcessed.csv"), 4096)
           .through(text.utf8Decode)
           .through(lowlevel.rows[IO, String]())
           .through(lowlevel.headers[IO, String])
-          .take(10)
           .through(TableRow.toTableRow)
           .through(insertionPipe(xa))
           .compile
-          .toList
-        _ <- elems.traverse(IO.println)
+          .count
+        end <- Clock[IO].monotonic
+        _   <- IO.println(s"Inserted $recordCount records in ${(end - start).toMillis} ms")
       } yield ExitCode.Success
     }
   }
