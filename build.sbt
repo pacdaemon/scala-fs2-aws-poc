@@ -8,7 +8,7 @@ ThisBuild / organizationName := "sciencebird"
 lazy val root = (project in file("."))
   .settings(
     name                 := "scala-fs2-aws-poc",
-    libraryDependencies ++= fs2.stack ++ doobie.stack :+ catsEffect ++ fs2Data.stack,
+    libraryDependencies ++= fs2.stack ++ doobie.stack ++ fs2Data.stack :+ catsEffect,
     libraryDependencies  += munit % Test
   )
 

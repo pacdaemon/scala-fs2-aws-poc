@@ -2,20 +2,16 @@ package io.sciencebird.fs2poc
 
 import cats.effect._
 import cats.implicits._
+import doobie._
 import doobie.implicits._
 import doobie.hikari._
-import doobie.util._
-import fs2.data.csv.lowlevel
 import fs2.io.file.Files
-import fs2.text
-import fs2.Pipe
 import fs2._
 import fs2.data.csv._
-import fs2.data.csv.generic.semiauto._
 
 import java.nio.file.Paths
 import java.util.Date
-import fs2.data.csv.CsvRowEncoder
+import java.text.SimpleDateFormat
 
 object Fs2Poc extends IOApp {
 
@@ -64,21 +60,70 @@ object Fs2Poc extends IOApp {
 
   val drop = sql"DROP TABLE IF EXISTS sample_data".update.run
 
-  case class Row(
-      indexId: String,
+  case class TableRow(
+      symbol: String,
       at: Date,
       open: BigDecimal,
       high: BigDecimal,
       low: BigDecimal,
       close: BigDecimal,
       adjClose: BigDecimal,
-      closeUds: BigDecimal
+      volume: BigDecimal,
+      closeUsd: BigDecimal
   )
-  object Row {
-    implicit val rowEncoder: CsvRowEncoder[Row, String] = deriveCsvRowEncoder
+
+  object TableRow {
+
+    //TODO: Fix this uggly parsing code
+    def toTableRow: Pipe[IO, CsvRow[String], TableRow] = { in =>
+      val format: SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd")
+      in.map { row =>
+        row.values.toList match {
+          case symbol :: at :: open :: high :: low :: close :: adjClose :: volume :: closeUsd :: Nil =>
+            try {
+              TableRow(
+                symbol,
+                format.parse(at),
+                BigDecimal.apply(open),
+                BigDecimal.apply(high),
+                BigDecimal.apply(low),
+                BigDecimal.apply(close),
+                BigDecimal.apply(adjClose),
+                BigDecimal.apply(volume),
+                BigDecimal.apply(closeUsd)
+              )
+            } catch {
+              case _: Throwable => throw new Exception(s"cannot parse row $row")
+            }
+          case _ => throw new Exception(s"cannot parse row $row")
+        }
+      }
+    }
   }
 
-  def insertionPipe: Pipe[IO, Row, Unit] = ???
+  var insert: Update[TableRow] =
+    Update[TableRow](
+      s"""
+        INSERT INTO sample_data (index_id,
+          at,
+          open,
+          high,
+          low,
+          close,
+          adj_close,
+          volume,
+          close_usd
+        ) VALUES(?,?,?,?,?,?,?,?,?)
+      """
+    )
+
+  def insertionPipe(xa: HikariTransactor[IO]): Pipe[IO, TableRow, Unit] = { in =>
+    in
+      .chunkN(4096)
+      .flatMap { rows =>
+        Stream.eval(insert.updateMany(rows).transact(xa).void)
+      }
+  }
 
   val transactor: Resource[IO, HikariTransactor[IO]] =
     for {
@@ -94,18 +139,20 @@ object Fs2Poc extends IOApp {
 
   def databaseProgram: IO[ExitCode] = {
 
-    val s = Files[IO]
-      .readAll(Paths.get("testdata/IndexProcessed.csv"), 4096)
-      .through(text.utf8Decode)
-      .through(lowlevel.rows[IO, String]())
-      .take(10)
-      .through(lowlevel.headers[IO, String])
-
     transactor.use { xa =>
       for {
-        _     <- (drop, create).mapN(_ + _).transact(xa)
-        elems <- s.compile.toList
-        _     <- elems.traverse(IO.println)
+        _ <- (drop, create).mapN(_ + _).transact(xa)
+        elems <- Files[IO]
+          .readAll(Paths.get("testdata/IndexProcessed.csv"), 4096)
+          .through(text.utf8Decode)
+          .through(lowlevel.rows[IO, String]())
+          .through(lowlevel.headers[IO, String])
+          .take(10)
+          .through(TableRow.toTableRow)
+          .through(insertionPipe(xa))
+          .compile
+          .toList
+        _ <- elems.traverse(IO.println)
       } yield ExitCode.Success
     }
   }
